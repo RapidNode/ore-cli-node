@@ -25,10 +25,10 @@ const MIN_SOL_BALANCE: f64 = 0.005;
 const RPC_RETRIES: usize = 0;
 const _SIMULATION_RETRIES: usize = 4;
 const GATEWAY_RETRIES: usize = 150;
-const CONFIRM_RETRIES: usize = 1;
+const CONFIRM_RETRIES: usize = 8;
 
-const CONFIRM_DELAY: u64 = 0;
-const GATEWAY_DELAY: u64 = 300;
+const CONFIRM_DELAY: u64 = 500;
+const GATEWAY_DELAY: u64 = 0; //300;
 
 pub enum ComputeBudget {
     Dynamic,
@@ -42,12 +42,12 @@ impl Miner {
         compute_budget: ComputeBudget,
         skip_confirm: bool,
     ) -> ClientResult<Signature> {
-        let progress_bar = spinner::new_progress_bar();
         let signer = self.signer();
         let client = self.rpc_client.clone();
+        let fee_payer = self.fee_payer();
 
         // Return error, if balance is zero
-        if let Ok(balance) = client.get_balance(&signer.pubkey()).await {
+        if let Ok(balance) = client.get_balance(&fee_payer.pubkey()).await {
             if balance <= sol_to_lamports(MIN_SOL_BALANCE) {
                 panic!(
                     "{} Insufficient balance: {} SOL\nPlease top up with at least {} SOL",
@@ -69,8 +69,15 @@ impl Miner {
                 final_ixs.push(ComputeBudgetInstruction::set_compute_unit_limit(cus))
             }
         }
+
+        let priority_fee = match &self.dynamic_fee_strategy {
+            Some(_) => self.dynamic_fee().await,
+            None => self.priority_fee.unwrap_or(0),
+        };
+        println!("  Priority fee: {} microlamports", priority_fee);
+
         final_ixs.push(ComputeBudgetInstruction::set_compute_unit_price(
-            self.priority_fee,
+            priority_fee,
         ));
         final_ixs.extend_from_slice(ixs);
 
@@ -82,19 +89,26 @@ impl Miner {
             max_retries: Some(RPC_RETRIES),
             min_context_slot: None,
         };
-        let mut tx = Transaction::new_with_payer(&final_ixs, Some(&signer.pubkey()));
+        let mut tx = Transaction::new_with_payer(&final_ixs, Some(&fee_payer.pubkey()));
 
         // Sign tx
         let (hash, _slot) = client
             .get_latest_blockhash_with_commitment(self.rpc_client.commitment())
             .await
             .unwrap();
-        tx.sign(&[&signer], hash);
+
+        if signer.pubkey() == fee_payer.pubkey() {
+            tx.sign(&[&signer], hash);
+        } else {
+            tx.sign(&[&signer, &fee_payer], hash);
+        }
 
         // Submit tx
+        let progress_bar = spinner::new_progress_bar();
         let mut attempts = 0;
         loop {
-            progress_bar.set_message(format!("Submitting transaction... (attempt {})", attempts));
+            progress_bar.set_message(format!("Submitting transaction... (attempt {})", attempts,));
+
             match client.send_transaction_with_config(&tx, send_cfg).await {
                 Ok(sig) => {
                     // Skip confirmation
